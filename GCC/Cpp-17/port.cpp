@@ -34,6 +34,8 @@
 #include "port_counting_sem.hpp"
 #include <chrono>
 #include <condition_variable>
+
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <stdint.h>
@@ -115,7 +117,7 @@ typedef struct ThreadState {
 
   bool hasTerminated;
 
-  std::thread::id xThreadId;
+  size_t xThreadId;
 
   ThreadState()
       : pvThread(nullptr), pvYieldEvent(nullptr), isSuspended(false),
@@ -127,7 +129,8 @@ typedef struct ThreadState {
  * Map of thread IDs to thread state structures.  This is used to obtain the
  * thread state structure from the thread ID when a thread is created.
  */
-static std::map<std::thread::id, ThreadState_t *> xThreadStateMap;
+static std::hash<std::thread::id> hasher;
+static std::map<size_t, ThreadState_t *> xThreadStateMap;
 
 /* Simulated interrupts waiting to be processed.  This is a bit mask where each
  * bit represents one interrupt, so a maximum of 32 interrupts can be simulated.
@@ -186,9 +189,8 @@ static void doSleep(int ms) {
 /*-----------------------------------------------------------*/
 
 static uint16_t prvSimulatedPeripheralTimer(void *lpParameter) {
-  TickType_t xMinimumWindowsBlockTime;
 
-  xMinimumWindowsBlockTime = (TickType_t)10;
+  TickType_t xMinimumWindowsBlockTime = (TickType_t)10;
 
   /* Just to prevent compiler warnings. */
   (void)lpParameter;
@@ -245,11 +247,14 @@ static bool prvEndProcess(uint16_t dwCtrlType) {
 
 /*-----------------------------------------------------------*/
 static void xLocalThreadRunner(ThreadState_t *pxThreadState) {
+
+  const size_t hsh = hasher(std::this_thread::get_id());
+
   // Get current thread ID
-  pxThreadState->xThreadId = std::this_thread::get_id();
+  pxThreadState->xThreadId = hsh;
 
   // Save this thread ID
-  xThreadStateMap[pxThreadState->xThreadId] = pxThreadState;
+  xThreadStateMap[hsh] = pxThreadState;
 
   pxThreadState->isSuspended = true;
   pxThreadState->pvYieldEvent->wait();
@@ -282,8 +287,10 @@ StackType_t *pxPortInitialiseStack(StackType_t *pxTopOfStack,
    * the stack that was created for the task - so the stack buffer is still
    * used, just not in the conventional way.  It will not be used for anything
    * other than holding this structure. */
+  const size_t ceilSize = ((sizeof(ThreadState_t) + 7)/8)*8;
+  configASSERT(ceilSize >= sizeof(ThreadState_t));
   ThreadState_t *const pxThreadState =
-      (ThreadState_t *)(pcTopOfStack - sizeof(ThreadState_t));
+      (ThreadState_t *)(pcTopOfStack - ceilSize);
 
   pxThreadState->isTerminated = false;
   pxThreadState->hasTerminated = false;
@@ -310,6 +317,9 @@ StackType_t *pxPortInitialiseStack(StackType_t *pxTopOfStack,
 
   // Let it loose, it will get stuck on the first yield
   pxThreadState->pvThread->detach();
+
+  // Put ourselves to sleep while it starts
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   configASSERT(
       pxThreadState
@@ -374,10 +384,12 @@ BaseType_t xPortStartScheduler(void) {
 
     /* Start the first task. */
     // ResumeThread(pxThreadState->pvThread);
-    pxThreadState->pvThread->detach();
-
+    //pxThreadState->pvThread->detach();
     /* The scheduler is now running. */
     xPortRunning = pdTRUE;
+
+    pxThreadState->pvYieldEvent->notify();
+
 
     /* Handle all simulated interrupts - including yield requests and
      * simulated ticks. */
@@ -496,8 +508,8 @@ static void prvProcessSimulatedInterrupts(void) {
         while (!pxThreadState->isSuspended) {
           doSleep(10);
           if (getMs() - currentTime > 10000) {
-            printf("Thread %d did not yield itself\n",
-                   pxThreadState->xThreadId);
+            std::cout << "Thread " << pxThreadState->xThreadId
+                      << " did not suspend" << std::endl;
           }
         }
         pvInterruptEvent->lock_mutex();
@@ -678,6 +690,10 @@ void vPortSetInterruptHandler(uint32_t ulInterruptNumber,
 /*-----------------------------------------------------------*/
 
 void vPortEnterCritical(void) {
+  if (!xPortRunning) {
+    return;
+  }
+
   if (xPortRunning == pdTRUE) {
     /* The interrupt event mutex is held for the entire critical section,
      * effectively disabling (simulated) interrupts. */
@@ -690,6 +706,10 @@ void vPortEnterCritical(void) {
 /*-----------------------------------------------------------*/
 
 void vPortExitCritical(void) {
+  if (!xPortRunning) {
+    return;
+  }
+
   int32_t lMutexNeedsReleasing = pdTRUE;
 
   /* The interrupt event mutex should already be held by this thread as it was

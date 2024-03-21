@@ -73,7 +73,7 @@ public:
       void *pMsg = queue.front();
       queue.pop_front();
       count--;
-      delete pMsg;
+      // delete pMsg;
     }
   }
 
