@@ -41,16 +41,46 @@
 #include <stdint.h>
 #include <thread>
 
-#define portMAX_INTERRUPTS                                                     \
-  ((uint32_t)sizeof(uint32_t) * 8UL) /* The number of bits in an uint32_t. */
-#define portNO_CRITICAL_NESTING ((uint32_t)0)
-
-/* The priorities at which the various components of the simulation execute. */
+#if defined(_MSC_VER)
+#include <windows.h>
 #define portDELETE_SELF_THREAD_PRIORITY                                        \
   THREAD_PRIORITY_TIME_CRITICAL /* Must be highest. */
 #define portSIMULATED_INTERRUPTS_THREAD_PRIORITY THREAD_PRIORITY_TIME_CRITICAL
 #define portSIMULATED_TIMER_THREAD_PRIORITY THREAD_PRIORITY_HIGHEST
 #define portTASK_THREAD_PRIORITY THREAD_PRIORITY_ABOVE_NORMAL
+#elif defined(__APPLE__) || defined(__linux__) || defined(__posix__)
+#define PORT_POSIX_THREADS 1
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
+#if (PORT_POSIX_THREADS > 0)
+#include <pthread.h>
+#include <sched.h>
+#define portDELETE_SELF_THREAD_PRIORITY sched_get_priority_max(SCHED_FIFO)
+#define portSIMULATED_INTERRUPTS_THREAD_PRIORITY                               \
+  sched_get_priority_max(SCHED_FIFO)
+#define portSIMULATED_TIMER_THREAD_PRIORITY sched_get_priority_max(SCHED_FIFO)
+#define portTASK_THREAD_PRIORITY (sched_get_priority_max(SCHED_FIFO) / 2)
+#endif
+
+#define portMAX_INTERRUPTS                                                     \
+  ((uint32_t)sizeof(uint32_t) * 8UL) /* The number of bits in an uint32_t. */
+
+#if (PORT_POSIX_THREADS > 0)
+static void SetThreadPriority(std::thread::native_handle_type h, int priority) {
+  // Set the priority of the thread
+  sched_param sch;
+  int policy = 0;
+  pthread_getschedparam(h, &policy, &sch);
+  sch.sched_priority = priority;
+  if (pthread_setschedparam(h, policy, &sch)) {
+    std::cerr << "Failed to set thread priority" << std::endl;
+  }
+}
+#endif
 
 /*
  * Created as a high priority thread, this function uses a timer to simulate
@@ -287,7 +317,7 @@ StackType_t *pxPortInitialiseStack(StackType_t *pxTopOfStack,
    * the stack that was created for the task - so the stack buffer is still
    * used, just not in the conventional way.  It will not be used for anything
    * other than holding this structure. */
-  const size_t ceilSize = ((sizeof(ThreadState_t) + 7)/8)*8;
+  const size_t ceilSize = ((sizeof(ThreadState_t) + 7) / 8) * 8;
   configASSERT(ceilSize >= sizeof(ThreadState_t));
   ThreadState_t *const pxThreadState =
       (ThreadState_t *)(pcTopOfStack - ceilSize);
@@ -315,6 +345,15 @@ StackType_t *pxPortInitialiseStack(StackType_t *pxTopOfStack,
   // Create a thread, but in suspended state.
   pxThreadState->pvThread = new std::thread(xLocalThreadRunner, pxThreadState);
 
+  std::thread::native_handle_type h = pxThreadState->pvThread->native_handle();
+
+#if defined(_MSC_VER)
+  // Get the native handle
+  SetThreadAffinityMask(h, 0x01);
+  SetThreadPriorityBoost(h, TRUE);
+#endif
+  SetThreadPriority(h, portTASK_THREAD_PRIORITY);
+
   // Let it loose, it will get stuck on the first yield
   pxThreadState->pvThread->detach();
 
@@ -324,17 +363,10 @@ StackType_t *pxPortInitialiseStack(StackType_t *pxTopOfStack,
   configASSERT(
       pxThreadState
           ->pvThread); /* See comment where TerminateThread() is called. */
-  // SetThreadAffinityMask(pxThreadState->pvThread, 0x01);
-
-  // SetThreadPriorityBoost(pxThreadState->pvThread, TRUE);
-  //  SetThreadPriority(pxThreadState->pvThread, portTASK_THREAD_PRIORITY);
-
-  // Set thread priority using std::thread::native_handle
-  // https://stackoverflow.com/questions/18318953/how-to-set-thread-priority-in-c11-stdthread
-  // https://en.cppreference.com/w/cpp/thread/native_handle
 
   return (StackType_t *)pxThreadState;
 }
+
 /*-----------------------------------------------------------*/
 
 BaseType_t xPortStartScheduler(void) {
@@ -369,35 +401,54 @@ BaseType_t xPortStartScheduler(void) {
     //                        CREATE_SUSPENDED, NULL);
     pvHandle = new std::thread(prvSimulatedPeripheralTimer, nullptr);
 
+    {}
+
     if (pvHandle != NULL) {
       // SetThreadPriority(pvHandle, portSIMULATED_TIMER_THREAD_PRIORITY);
       // SetThreadPriorityBoost(pvHandle, TRUE);
       // SetThreadAffinityMask(pvHandle, 0x01);
       // ResumeThread(pvHandle);
       pvHandle->detach();
+      std::thread::native_handle_type h = pvHandle->native_handle();
+#ifdef _MSC_VER
+      SetThreadPriorityBoost(h, TRUE);
+      SetThreadAffinityMask(h, 0x01);
+#endif
+      SetThreadPriority(h, portSIMULATED_TIMER_THREAD_PRIORITY);
     }
 
     /* Start the highest priority task by obtaining its associated thread
      * state structure, in which is stored the thread handle. */
     pxThreadState = (ThreadState_t *)*((uintptr_t *)pxCurrentTCB);
-    ulCriticalNesting = portNO_CRITICAL_NESTING;
+    ulCriticalNesting = 0;
 
     /* Start the first task. */
     // ResumeThread(pxThreadState->pvThread);
-    //pxThreadState->pvThread->detach();
+    // pxThreadState->pvThread->detach();
     /* The scheduler is now running. */
     xPortRunning = pdTRUE;
 
     pxThreadState->pvYieldEvent->notify();
 
-
     /* Handle all simulated interrupts - including yield requests and
      * simulated ticks. */
-    prvProcessSimulatedInterrupts();
+    {
+      std::thread pvInterruptsHandle =
+          std::thread(prvProcessSimulatedInterrupts);
+      std::thread::native_handle_type h = pvInterruptsHandle.native_handle();
+      SetThreadPriority(h, portSIMULATED_INTERRUPTS_THREAD_PRIORITY);
+#ifdef _MSC_VER
+      SetThreadPriorityBoost(h, TRUE);
+      SetThreadAffinityMask(h, 0x01);
+#endif
+      pvInterruptsHandle.detach();
+    }
+
+    while (1) {
+      doSleep(1000);
+    }
   }
 
-  /* Would not expect to return from prvProcessSimulatedInterrupts(), so should
-   * not get here. */
   return 0;
 }
 /*-----------------------------------------------------------*/
@@ -420,29 +471,22 @@ static uint32_t prvProcessTickInterrupt(void) {
 /*-----------------------------------------------------------*/
 
 static void prvProcessSimulatedInterrupts(void) {
-  uint32_t ulSwitchRequired, i;
-  ThreadState_t *pxThreadState;
-  void *pvObjectList[2];
-  // CONTEXT xContext;
-  uint16_t xResult;
+  uint32_t ulSwitchRequired = pdFALSE;
+  ThreadState_t *pxThreadState = nullptr;
+
+  uint16_t xResult = pdFAIL;
   const uint16_t xTimeoutMilliseconds = 1000;
 
   /* Create a pending tick to ensure the first task is started as soon as
    * this thread pends. */
   ulPendingInterrupts |= (1 << portINTERRUPT_TICK);
-  // SetEvent(pvInterruptEvent);
+
   // Wake up the interrupt event
   pvInterruptEvent->notify();
 
   while (xPortRunning) {
     xInsideInterrupt = pdFALSE;
 
-    /* Wait with timeout so that we can exit from this loop when
-     * the scheduler is stopped by calling vPortEndScheduler. */
-    // xResult = WaitForMultipleObjects(sizeof(pvObjectList) / sizeof(void *),
-    //                                  pvObjectList, TRUE,
-    //                                  xTimeoutMilliseconds);
-    // Wait for pvInterruptEvent
     pvInterruptEvent->wait();
 
     pvInterruptEvent->lock_mutex();
@@ -458,30 +502,30 @@ static void prvProcessSimulatedInterrupts(void) {
      * necessitated a context switch to another task/thread. */
     ulSwitchRequired = pdFALSE;
 
-    /* For each interrupt we are interested in processing, each of which is
-     * represented by a bit in the 32bit ulPendingInterrupts variable. */
-    for (i = 0; i < portMAX_INTERRUPTS; i++) {
-      /* Is the simulated interrupt pending? */
-      if ((ulPendingInterrupts & (1UL << i)) != 0) {
-        /* Is a handler installed? */
-        if (ulIsrHandler[i] != NULL) {
-          /* Run the actual handler.  Handlers return pdTRUE if they
-           * necessitate a context switch. */
-          if (ulIsrHandler[i]() != pdFALSE) {
-            /* A bit mask is used purely to help debugging. */
-            ulSwitchRequired |= (1 << i);
+    if (ulPendingInterrupts != 0) {
+      /* For each interrupt we are interested in processing, each of which is
+       * represented by a bit in the 32bit ulPendingInterrupts variable. */
+      for (uint32_t i = 0; i < portMAX_INTERRUPTS; i++) {
+        /* Is the simulated interrupt pending? */
+        if ((ulPendingInterrupts & (1UL << i)) != 0) {
+          /* Is a handler installed? */
+          if (ulIsrHandler[i] != nullptr) {
+            /* Run the actual handler.  Handlers return pdTRUE if they
+             * necessitate a context switch. */
+            if (ulIsrHandler[i]() != pdFALSE) {
+              /* A bit mask is used purely to help debugging. */
+              ulSwitchRequired |= (1 << i);
+            }
           }
-        }
 
-        /* Clear the interrupt pending bit. */
-        ulPendingInterrupts &= ~(1UL << i);
+          /* Clear the interrupt pending bit. */
+          ulPendingInterrupts &= ~(1UL << i);
+        }
       }
     }
 
-    if (ulSwitchRequired != pdFALSE) {
-      void *pvOldCurrentTCB;
-
-      pvOldCurrentTCB = pxCurrentTCB;
+    if (ulSwitchRequired) {
+      void *const pvOldCurrentTCB = pxCurrentTCB;
 
       /* Select the next task to run. */
       vTaskSwitchContext();
@@ -500,29 +544,25 @@ static void prvProcessSimulatedInterrupts(void) {
          * yield operation in case the 'suspend' operation doesn't take
          * effect immediately.  */
         pxThreadState = (ThreadState_t *)*((size_t *)pvOldCurrentTCB);
-        // SuspendThread(pxThreadState->pvThread);
-
-        pvInterruptEvent->unlock_mutex();
-        // Wait for this thread to yield itself
-        const auto currentTime = getMs();
-        while (!pxThreadState->isSuspended) {
-          doSleep(10);
-          if (getMs() - currentTime > 10000) {
-            std::cout << "Thread " << pxThreadState->xThreadId
-                      << " did not suspend" << std::endl;
-          }
+        std::thread::native_handle_type h =
+            pxThreadState->pvThread->native_handle();
+#ifdef _MSC_VER
+        SuspendThread(h);
+#elif defined(__APPLE__)
+        // To suspend a thread
+        kern_return_t kr;
+        kr = thread_suspend(pthread_mach_thread_np(h));
+        if (kr != KERN_SUCCESS) {
+          // handle error
         }
-        pvInterruptEvent->lock_mutex();
 
-        /* Ensure the thread is actually suspended by performing a
-         *  synchronous operation that can only complete when the thread is
-         *  actually suspended.  The below code asks for dummy register
-         *  data.  Experimentation shows that these two lines don't appear
-         *  to do anything now, but according to
-         *  https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743
-         *  they do - so as they do not harm (slight run-time hit). */
-        // xContext.ContextFlags = CONTEXT_INTEGER;
-        //(void)GetThreadContext(pxThreadState->pvThread, &xContext);
+        // To resume a thread
+        // kr = thread_resume(pthread_mach_thread_np(h));
+        // if (kr != KERN_SUCCESS) {
+        // handle error
+        //}
+#else
+#endif
 
         /* Obtain the state of the task now selected to enter the
          * Running state. */
@@ -650,7 +690,7 @@ void vPortGenerateSimulatedInterrupt(uint32_t ulInterruptNumber) {
      * mutexes are accumulative.  If in a critical section then the event
      * will get set when the critical section nesting count is wound back
      * down to zero. */
-    if (ulCriticalNesting == portNO_CRITICAL_NESTING) {
+    if (ulCriticalNesting == 0) {
       // SetEvent(pvInterruptEvent);
       pvInterruptEvent->notify();
 
@@ -663,7 +703,7 @@ void vPortGenerateSimulatedInterrupt(uint32_t ulInterruptNumber) {
     // ReleaseMutex(pvInterruptEventMutex);
     pvInterruptEvent->unlock_mutex();
 
-    if (ulCriticalNesting == portNO_CRITICAL_NESTING) {
+    if (ulCriticalNesting == 0) {
       /* An interrupt was pended so ensure to block to allow it to
        * execute.  In most cases the (simulated) interrupt will have
        * executed before the next line is reached - so this is just to make
@@ -715,13 +755,12 @@ void vPortExitCritical(void) {
   /* The interrupt event mutex should already be held by this thread as it was
    * obtained on entry to the critical section. */
 
-  if (ulCriticalNesting > portNO_CRITICAL_NESTING) {
+  if (ulCriticalNesting > 0) {
     ulCriticalNesting--;
 
     /* Don't need to wait for any pending interrupts to execute if the
      * critical section was exited from inside an interrupt. */
-    if ((ulCriticalNesting == portNO_CRITICAL_NESTING) &&
-        (xInsideInterrupt == pdFALSE)) {
+    if ((ulCriticalNesting == 0) && (xInsideInterrupt == pdFALSE)) {
       /* Were any interrupts set to pending while interrupts were
        * (simulated) disabled? */
       if (ulPendingInterrupts != 0UL) {
