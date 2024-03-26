@@ -197,8 +197,10 @@ static volatile uint32_t ulCriticalNesting = 9999UL;
  * differently, all the other interrupts can be user defined. */
 static uint32_t (*ulIsrHandler[portMAX_INTERRUPTS])(void) = {0};
 
+extern "C" {
 /* Pointer to the TCB of the currently executing task. */
-extern void *volatile pxCurrentTCB;
+extern portDONT_DISCARD PRIVILEGED_DATA TCB_t* volatile pxCurrentTCB;
+}
 
 /* Used to ensure nothing is processed during the startup sequence. */
 static BaseType_t xPortRunning = pdFALSE;
@@ -634,10 +636,8 @@ void vPortDeleteThread(void *pvTaskToDelete) {
 void vPortCloseRunningThread(void *pvTaskToDelete,
                              volatile BaseType_t *pxPendYield) {
 
-  uint32_t ulErrorCode;
+  uint32_t ulErrorCode = 0;
 
-  /* Remove compiler warnings if configASSERT() is not defined. */
-  (void)ulErrorCode;
 
   /* Find the handle of the thread being deleted. */
   ThreadState_t *pxThreadState = (ThreadState_t *)(*(size_t *)pvTaskToDelete);
